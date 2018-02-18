@@ -1,0 +1,7 @@
+[package]
+name = "enshrinken"
+version = "0.1.0"
+authors = ["Aaron Gallagher <_@habnab.it>"]
+
+[dependencies]
+pom = "1"
