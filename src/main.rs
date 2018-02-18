@@ -1,4 +1,9 @@
+extern crate byteorder;
 extern crate pom;
+extern crate rand;
+extern crate ring;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 mod parser {
     use pom::char_class::{alphanum, digit};
@@ -62,6 +67,7 @@ mod parser {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Node {
         Preprocessor { directive: S<String>, value: S<String> },
+        Define { directive: S<String>, name: S<String>, value: Vec<Token> },
         Token(Token),
     }
 
@@ -71,6 +77,13 @@ mod parser {
             match *self {
                 Preprocessor { ref directive, ref value } =>
                     write!(f, "{}{}", directive, value),
+                Define { ref directive, ref name, ref value } => {
+                    write!(f, "{}{}", directive, name)?;
+                    for t in value {
+                        write!(f, "{}", t)?;
+                    }
+                    write!(f, "\n")
+                },
                 Token(ref t) =>
                     write!(f, "{}", t),
             }
@@ -145,16 +158,27 @@ mod parser {
         seqs.fold(first_seq, |a, b| a | b)
     }
 
+    fn preprocessor_define() -> Parser<u8, Node> {
+        (spaced_string(seq(b"#define")) + ident() + spaced(to_eol()))
+            .convert::<_, pom::Error, _>(|((directive, name), spaced_value)| {
+                let mut input = spaced_value.inner;
+                input.push_str(&spaced_value.trailer);
+                let mut data_input = pom::DataInput::new(input.as_bytes());
+                let value = token().repeat(0..).parse(&mut data_input)?;
+                Ok(Node::Define { directive, name, value })
+            })
+    }
+
     fn preprocessor_line() -> Parser<u8, Node> {
         let directive = spaced((sym(b'#') + slice_to_seqs(&[
-            b"define", b"ifdef", b"ifdef", b"if", b"else", b"elif", b"endif",
+            b"if", b"else", b"elif", b"endif", b"ifdef", b"ifdef",
             b"undef", b"pragma", b"version", b"error", b"extension", b"line",
         ])).map(|(b, mut v)| {
             v.insert(0, b);
             utf8(v)
         }));
         (directive + spaced(to_eol()))
-            .map(|(directive, value)| Node::Preprocessor { directive, value })
+            .map(|(directive,  value)| Node::Preprocessor { directive, value })
     }
 
     fn ident() -> Parser<u8, S<String>> {
@@ -191,6 +215,7 @@ mod parser {
 
     fn node() -> Parser<u8, Node> {
         preprocessor_line()
+            | preprocessor_define()
             | token().map(Node::Token)
     }
 
@@ -203,8 +228,6 @@ mod parser {
         file().parse(&mut input)
     }
 }
-
-use parser::S;
 
 fn condense_token(t: &mut parser::Token, next: Option<&parser::Token>) {
     use parser::Token::*;
@@ -241,11 +264,95 @@ fn condense_tokens(ts: &mut [parser::Token]) {
     }
 }
 
+fn default_reserved() -> BTreeSet<String> {
+    let mut ret = BTreeSet::new();
+    ret.extend([
+        "attribute", "const", "bool", "float", "int", "break", "continue",
+        "do", "else", "for", "if", "discard", "return", "in", "out", "inout",
+        "uniform", "varying", "sampler2D", "samplerCube", "struct", "void",
+        "while", "highp", "mediump", "lowp", "true", "false",
+    ].iter().map(|&s| s.into()));
+    for n in &[2, 3, 4] {
+        ret.insert(format!("mat{}", n));
+        ret.insert(format!("vec{}", n));
+        for k in "bi".chars() {
+            ret.insert(format!("{}vec{}", k, n));
+        }
+    }
+    ret
+}
+
+struct NameScrambler {
+    base: ring::digest::Context,
+    reserved: BTreeSet<String>,
+    unscrambled: BTreeMap<String, String>,
+}
+
+impl NameScrambler {
+    fn new(input: &[u8]) -> Self {
+        let mut base = ring::digest::Context::new(&ring::digest::SHA256);
+        base.update(input);
+        NameScrambler {
+            base,
+            reserved: default_reserved(),
+            unscrambled: Default::default(),
+        }
+    }
+
+    fn build_rng(&mut self, name: &str) -> rand::ChaChaRng {
+        use byteorder::{ByteOrder, LE};
+        let mut ctx = self.base.clone();
+        ctx.update(name.as_bytes());
+        let digest = ctx.finish();
+        let digest_bytes = digest.as_ref();
+        let mut digest_u32 = vec![0u32; digest_bytes.len() / 4];
+        LE::read_u32_into(&digest_bytes, &mut digest_u32);
+        <rand::ChaChaRng as rand::SeedableRng<_>>::from_seed(&digest_u32)
+    }
+
+    fn scrambled(&mut self, name: &str) -> String {
+        if self.reserved.contains(name) {
+            return name.into();
+        }
+        use rand::Rng;
+        let mut rng = self.build_rng(name);
+        let length = rng.gen_range(4, 8);
+        let out: String = (0..length)
+            .filter_map(|_| rng.choose(&['a', 'e', 'o', 'u']).cloned())
+            .collect();
+        match self.unscrambled.insert(out.clone(), name.into()) {
+            Some(ref s) if s != name => panic!("{:?} derived from {:?} and {:?}", out, name, s),
+            _ => (),
+        }
+        out
+    }
+
+    fn scramble_tokens(&mut self, ts: &mut [parser::Token]) {
+        for t in ts {
+            self.scramble_token(t);
+        }
+    }
+
+    fn scramble_token(&mut self, t: &mut parser::Token) {
+        use parser::Token::*;
+        match *t {
+            Ident(ref mut s) => {
+                s.inner = self.scrambled(&s.inner);
+            },
+            Tree { ref mut inner, .. } => {
+                self.scramble_tokens(inner);
+            },
+            _ => (),
+        }
+    }
+}
+
 fn main() {
     use std::io::{Read, stdin};
     let mut input = String::new();
     stdin().read_to_string(&mut input).unwrap();
     let mut f = parser::parse_string(&input).unwrap();
+    let mut scrambler = NameScrambler::new(input.as_bytes());
     println!("parsed: {:#?}", f);
     f.0.trailer.clear();
     for e in 0..f.1.len() {
@@ -255,14 +362,25 @@ fn main() {
                 value.trailer.clear();
                 value.trailer.push('\n');
             },
+            parser::Node::Define { ref mut name, ref mut value, .. } => {
+                name.trailer.clear();
+                name.trailer.push(' ');
+                name.inner = scrambler.scrambled(&name.inner);
+                condense_tokens(value);
+                scrambler.scramble_tokens(value);
+            },
             parser::Node::Token(ref mut tok) => {
                 let next_tok = next.and_then(|n| match *n {
                     parser::Node::Token(ref t) => Some(t),
                     _ => None,
                 });
                 condense_token(tok, next_tok);
+                scrambler.scramble_token(tok);
             },
         }
+    }
+    for (scrambled, unscrambled) in &scrambler.unscrambled {
+        println!("{}={}", scrambled, unscrambled);
     }
     println!("{}", f);
 }
